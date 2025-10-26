@@ -1,0 +1,340 @@
+---
+alwaysApply: true
+---
+
+승인 확인. 아래는 Cursor로 바로 작업 시작할 수 있는 general-rule야. 그대로 복붙해 팀 규칙으로 쓰면 된다.
+
+⸻
+
+SAPIENTIA — Cursor General Rules (MVP)
+
+0) 스코프
+	•	MVP 목표: “타인의 정보 → 나의 관점 재해석 → 3개 행동”을 한 화면에서 끝낸다.
+	•	비포함: 실사용자 초대, 결제, 소셜 공유, 서버 DB.
+	•	가치 렌즈: 온보딩에서 선택한 상위 3가치만 우선 반영.
+
+⸻
+
+1) 기술 스택
+	•	Next.js 15(App Router) + TypeScript + TailwindCSS
+	•	상태/스토리지: localStorage + IndexedDB(localforage)
+	•	아이콘: lucide-react
+	•	배포: Vercel
+	•	LLM 프록시: Vercel Edge Functions로 OpenAI GPT-4o-mini 호출
+클라이언트에서 API 키 직접 호출 금지
+
+⸻
+
+2) 디자인 토큰
+
+2.1 CSS 변수(전역)
+
+:root {
+  --bg: #0D0D0D;
+  --surface: #111213;
+  --text: #EAEAEA;
+  --text-subtle: #72757E;
+  --border: #1E1E1E;
+  --accent: #7F5AF0;   /* Main */
+  --info: #22D3EE;     /* Sub(링크/보조 포인트) */
+  --radius: 16px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.35);
+}
+html, body { background: var(--bg); color: var(--text); }
+
+2.2 Tailwind 설정 요약
+
+// tailwind.config.ts
+import type { Config } from 'tailwindcss';
+const config: Config = {
+  darkMode: 'class',
+  content: ['./app/**/*.{ts,tsx}', './components/**/*.{ts,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        bg: 'var(--bg)',
+        surface: 'var(--surface)',
+        text: 'var(--text)',
+        subtle: 'var(--text-subtle)',
+        border: 'var(--border)',
+        accent: 'var(--accent)',
+        info: 'var(--info)',
+      },
+      borderRadius: { '2xl': 'var(--radius)' },
+      boxShadow: { soft: 'var(--shadow)' },
+    },
+  },
+  plugins: [],
+};
+export default config;
+
+2.3 타이포그래피
+	•	Pretendard 기본. 본문 15–16px. 줄간 1.6
+	•	헤더는 굵기로만 위계 표현. 컬러 남용 금지
+	•	CTA와 활성 토글만 accent
+
+2.4 접근성
+	•	텍스트 대비 AA 이상
+	•	포커스 링 항상 노출. outline-offset: 2px
+	•	애니메이션은 150–250ms. 모션 최소화 옵션 고려
+
+⸻
+
+3) 폴더 구조
+
+/app
+  /(public)
+    page.tsx                // 랜딩 + 가치 설명 3줄
+  /(app)
+    layout.tsx
+    page.tsx                // 메인: 질문→설명→재해석→행동
+    onboarding/page.tsx     // 가치 선택
+    graph/page.tsx          // 가치 히트맵(간단)
+  /(api)
+    /generate/route.ts      // Edge Function: LLM 프록시
+/components
+  LensToggle.tsx
+  NodeCard.tsx
+  InsightEditor.tsx
+  ActionList.tsx
+  WhyThisTooltip.tsx
+  MiniGraph.tsx
+/lib
+  storage.ts                // localStorage + IndexedDB 어댑터
+  scoring.ts                // 개인화 점수 함수
+  prompts.ts                // 프롬프트 템플릿
+  schemas.ts                // TS 타입 정의
+  guards.ts                 // 의사결정 필터
+  uuid.ts
+/styles
+  globals.css
+
+
+⸻
+
+4) 데이터 모델(타입)
+
+// schemas.ts
+export type ValueId = 'autonomy' | 'growth' | 'solidarity' | 'stability' | 'aesthetics' | 'integrity';
+
+export type UserValueWeight = { valueId: ValueId; weight: number }; // 0~1
+export type UserValueProfile = {
+  clientId: string;
+  topValues: UserValueWeight[];  // 길이 3
+  updatedAt: string;
+};
+
+export type Node = {
+  id: string;
+  title: string;
+  summary: string;
+  valueVector: Partial<Record<ValueId, number>>; // 0~1
+  confidence?: number; // 태깅 신뢰도
+};
+
+export type Insight = {
+  id: string;
+  nodeId: string;
+  myRewrite: string;     // 내 언어 재해석
+  actions: string[];     // 3개 행동
+  lensUsed: ValueId[];   // 적용 렌즈
+  createdAt: string;
+};
+
+export type EventLog = {
+  ts: string;
+  clientId: string;
+  nodeId?: string;
+  type: 'view' | 'save' | 'skip' | 'rewrite' | 'action_done';
+  dwellMs?: number;
+  meta?: Record<string, any>;
+};
+
+
+⸻
+
+5) 스토리지 규칙
+	•	Auth 대체: 닉네임 + 4자리 PIN 입력 → client_id(UUID) 생성 → localStorage 저장
+	•	데이터: IndexedDB(localforage) 사용. 키 네임스페이스 고정
+	•	svp:{client_id}: UserValueProfile
+	•	node:*: Node 캐시
+	•	insight:*: Insight
+	•	elog:*: EventLog
+	•	마이그레이션 대비: 필드명은 Supabase 테이블로 그대로 이식
+
+⸻
+
+6) 개인화 점수 함수
+
+// scoring.ts
+export function scoreNode(user: UserValueProfile, node: Node) {
+  const cos = cosine(user.topValues, node.valueVector); // 간이 코사인
+  const novelty = 0.2;   // MVP 상수
+  const recency = 0.1;   // MVP 상수
+  const difficulty = 0.2; // TODO: 온보딩 난이도 매칭
+  return 0.5 * cos + 0.2 * difficulty + 0.2 * novelty + 0.1 * recency;
+}
+
+상위 점수 5개만 메인 화면 추천
+
+⸻
+
+7) LLM 프록시와 프롬프트
+
+7.1 API 라우트(Edge)
+
+// app/(api)/generate/route.ts
+import { NextRequest } from 'next/server';
+export const runtime = 'edge';
+export async function POST(req: NextRequest) {
+  const { mode, payload } = await req.json(); // mode: 'rewrite' | 'actions'
+  const sys = mode === 'rewrite'
+    ? 'You are a concise assistant that rewrites information into the user’s own voice in Korean.'
+    : 'You are a pragmatic assistant that proposes three small, value-aligned actions in Korean.';
+  const body = {
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: sys },
+      { role: 'user', content: JSON.stringify(payload) }
+    ],
+    temperature: 0.5,
+  };
+  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json();
+  return new Response(JSON.stringify({ ok: true, data }), { headers: { 'Content-Type': 'application/json' }});
+}
+
+7.2 프롬프트 규격
+
+// prompts.ts
+export const RewritePrompt = (info: string, valueLens: ValueId[]) => ({
+  info,
+  instruction: '위 정보를 내 언어로 한 단락으로 재해석. 불필요한 수식어 금지. 한계나 가정이 있으면 짧게 명시.',
+  value_lens: valueLens
+});
+
+export const ActionPrompt = (myRewrite: string, valueLens: ValueId[]) => ({
+  my_rewrite: myRewrite,
+  instruction: '다음 72시간 안에 실행 가능한 작은 행동 3개. 각 1문장. 가치 렌즈를 반영.',
+  value_lens: valueLens,
+  templates: {
+    growth: ['작은 실험 1개', '주간 회고 체크'],
+    solidarity: ['공유 1회', '토론 질문 2개'],
+    stability: ['리스크 3항목', '최소 실행 버전'],
+    aesthetics: ['스토리 프레이밍 1포인트']
+  }
+});
+
+
+⸻
+
+8) 핵심 컴포넌트와 UX 규칙
+
+8.1 LensToggle
+	•	최상위 3가치 토글. 멀티 선택 허용. 선택 시 즉시 재점수 반영
+	•	토글 상태는 session_value_context로 이벤트 기록
+
+8.2 NodeCard
+	•	제목, 한 줄 요약, 가치 뱃지 테두리(accent 투명도 가중)
+	•	WhyThisTooltip: “추천 이유” 노출
+가치 적합도 0.82 · 신규성 높음
+
+8.3 InsightEditor
+	•	좌: 원문 정보 요약 5줄. 우: 내 언어 재해석 입력창
+	•	버튼 2개: “LLM로 재해석 제안”, “직접 작성”
+	•	저장 시 Insight 생성 → ActionList 자동 갱신
+
+8.4 ActionList
+	•	3개 행동. 체크박스. 체크 시 action_done 이벤트 기록
+	•	72시간 리마인드용 로컬 알림 권장(브라우저 알림은 보류)
+
+8.5 MiniGraph
+	•	노드 10개 미니 그래프. 가치 히트맵 테두리 굵기만 사용. 인터랙션 최소
+
+⸻
+
+9) 로깅 규칙
+	•	모든 화면 체류시간 dwell_ms 기록. 간격 5초 배칭 → IndexedDB
+	•	이벤트 키: elog:{ts}:{type}
+	•	지표 파생
+	•	재해석 완료율: rewrite → save 체인 비율
+	•	IAR: insight.created / rewrite.attempted
+	•	72h 실행율: action_done within 72h / insight.created
+
+⸻
+
+10) 가드레일
+	•	개인정보 전송 금지. LLM에 이메일 전화 주소 금지
+	•	정치·의료 조언 금지. 해당 주제 입력 시 중립 안내와 전문기관 권고
+	•	권리·비폭력 문구 표준 삽입: 추천은 제안일 뿐 강요 아님
+
+⸻
+
+11) 의사결정 필터(상수화)
+
+// guards.ts
+export const decisionFilters = [
+  '10분 안에 명료성 상승 여부',
+  '72시간 안 실행 가능 여부',
+  '다른 사람도 따라 할 패턴 여부',
+  '권리·비폭력 원칙 준수 여부',
+  '지표로 추적 가능 여부',
+];
+
+
+⸻
+
+12) 환경변수와 배포
+	•	Vercel Project → Environment Variables
+	•	OPENAI_API_KEY: Required
+	•	ALLOW_ORIGIN: 배포 도메인
+	•	NEXT_PUBLIC_APP_NAME=SAPIENTIA
+	•	브랜치 전략: main 프로덕션, dev 프리뷰
+	•	커밋 컨벤션: feat:, fix:, chore:, refactor:, style:, docs:
+
+⸻
+
+13) 테스트
+	•	단위: lib/*.ts 함수 Jest
+	•	E2E: Playwright로 온보딩→재해석→행동 체크 플로우 1케이스
+	•	품질 바: 첫 배포 전 LCP < 2.5s, 콘솔 경고 0
+
+⸻
+
+14) 코드 스타일
+	•	ESLint + Prettier 기본. 불필요한 콤마 금지
+	•	함수는 40줄 내. 컴포넌트 한 파일 200줄 내
+	•	명명은 행동 중심. 예 saveInsight, scoreAndRecommend
+
+⸻
+
+15) 피처 플래그
+
+export const FLAGS = {
+  USE_LLM: true,          // 템플릿 모드로 토글 가능
+  SHOW_MINI_GRAPH: true,
+  ENABLE_LOCAL_REMINDER: true,
+};
+
+
+⸻
+
+16) 초기 작업 순서
+	1.	Tailwind + 토큰 세팅 완료
+	2.	온보딩 페이지 제작(가치 6개 중 3개 선택)
+	3.	메인 화면 골격 배치(LensToggle + Node 리스트 + InsightEditor + ActionList)
+	4.	LLM 프록시 라우트 연결 및 템플릿 모드 스위치
+	5.	로깅 배치 저장
+	6.	Vercel 프리뷰 배포
+
+⸻
+
+
+
+
+
+
